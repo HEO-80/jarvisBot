@@ -133,8 +133,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     logger.info(f"Voz transcrita: {user_text}")
-    await update.message.reply_text(f"_{user_text}_", parse_mode="Markdown")
-
     await update.message.chat.send_action(ChatAction.TYPING)
     response = CEREBRO.chat(user_text)
 
