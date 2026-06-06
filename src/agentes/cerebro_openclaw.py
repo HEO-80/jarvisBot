@@ -4,10 +4,11 @@ Gestiona el contexto de conversación, razona sobre las peticiones
 y decide qué herramientas invocar.
 """
 import logging
+from datetime import datetime
 
 import google.generativeai as genai
 
-from config import GEMINI_API_KEY, GEMINI_MODEL, SYSTEM_PROMPT
+from config import GEMINI_API_KEY, GEMINI_MODEL, get_system_prompt
 from agentes.herramienta_interpreter import InterpreterTool
 
 logger = logging.getLogger("jarvis.cerebro")
@@ -34,7 +35,15 @@ def _build_tools() -> list:
             required=["instruction"],
         ),
     )
-    return [genai.protos.Tool(function_declarations=[execute_code])]
+    get_datetime = genai.protos.FunctionDeclaration(
+        name="get_datetime",
+        description="Devuelve la fecha y hora actual del sistema. Úsala cuando el usuario pregunte qué hora es, qué día es hoy, etc.",
+        parameters=genai.protos.Schema(
+            type=genai.protos.Type.OBJECT,
+            properties={},
+        ),
+    )
+    return [genai.protos.Tool(function_declarations=[execute_code, get_datetime])]
 
 
 class Cerebro:
@@ -42,39 +51,37 @@ class Cerebro:
         genai.configure(api_key=GEMINI_API_KEY)
 
         self.tools = _build_tools()
-        self.model = genai.GenerativeModel(
-            model_name=GEMINI_MODEL,
-            system_instruction=SYSTEM_PROMPT,
-            tools=self.tools,
-        )
-
+        self._auto_run = auto_run
         self.interpreter = InterpreterTool(auto_run=auto_run)
         self.history: list[dict] = []
         logger.info(f"Cerebro iniciado con modelo {GEMINI_MODEL}")
+
+    def _get_model(self) -> genai.GenerativeModel:
+        return genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            system_instruction=get_system_prompt(),
+            tools=self.tools,
+        )
 
     def _trim_history(self):
         if len(self.history) > MAX_HISTORY:
             self.history = self.history[-MAX_HISTORY:]
 
     def chat(self, user_message: str) -> str:
-        """
-        Procesa un mensaje del usuario y devuelve la respuesta de Jarvis.
-        Gestiona el loop de function calling automáticamente.
-        """
         logger.info(f"Usuario: {user_message[:100]}")
         self._trim_history()
 
         self.history.append({"role": "user", "parts": [user_message]})
 
         try:
-            chat_session = self.model.start_chat(history=self.history[:-1])
+            model = self._get_model()
+            chat_session = model.start_chat(history=self.history[:-1])
             response = chat_session.send_message(user_message)
 
             # Loop de function calling
             while response.candidates[0].content.parts:
                 part = response.candidates[0].content.parts[0]
 
-                # Si hay una llamada a función
                 if hasattr(part, "function_call") and part.function_call.name:
                     fn_name = part.function_call.name
                     fn_args = dict(part.function_call.args)
@@ -82,13 +89,8 @@ class Cerebro:
 
                     tool_result = self._dispatch_tool(fn_name, fn_args)
 
-                    # Añadir al historial la respuesta del modelo con la tool call
-                    self.history.append({
-                        "role": "model",
-                        "parts": [part]
-                    })
+                    self.history.append({"role": "model", "parts": [part]})
 
-                    # Enviar resultado de vuelta al modelo
                     response = chat_session.send_message(
                         genai.protos.Content(
                             role="function",
@@ -115,7 +117,9 @@ class Cerebro:
     def _dispatch_tool(self, name: str, args: dict) -> str:
         if name == "execute_code":
             return self.interpreter.execute(args.get("instruction", ""))
-        # Más tools se añaden aquí en Fase 4 (Notion, Gmail)
+        if name == "get_datetime":
+            now = datetime.now()
+            return now.strftime("%A, %d de %B de %Y, %H:%M:%S")
         logger.warning(f"Tool desconocida: {name}")
         return f"Tool '{name}' no disponible."
 

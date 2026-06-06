@@ -1,85 +1,117 @@
 """
-Open Interpreter como herramienta ejecutora.
-Recibe instrucciones en lenguaje natural y ejecuta código/comandos en el sistema.
+Ejecutor de código y comandos del sistema.
+Implementa la tool execute_code de Jarvis sin depender de open-interpreter.
+Soporta bash y Python con timeout y límite de output.
 """
 import logging
-from typing import Any
+import subprocess
+import tempfile
+import os
+import re
+from pathlib import Path
 
 logger = logging.getLogger("jarvis.interpreter")
 
+TIMEOUT = 30
+MAX_OUTPUT = 4000
+WORK_DIR = str(Path.home())
+
 
 class InterpreterTool:
-    """Wrapper de Open Interpreter para uso como tool de Gemini."""
-
     def __init__(self, auto_run: bool = False, safe_mode: str = "ask"):
         self.auto_run = auto_run
         self.safe_mode = safe_mode
-        self._interpreter = None
-
-    def _get_interpreter(self):
-        if self._interpreter is None:
-            try:
-                from interpreter import interpreter
-                interpreter.auto_run = self.auto_run
-                interpreter.llm.model = "gemini/gemini-2.5-flash"
-                interpreter.llm.supports_functions = True
-                self._interpreter = interpreter
-                logger.info("Open Interpreter inicializado")
-            except ImportError:
-                logger.error("open-interpreter no instalado. Ejecuta: pip install open-interpreter")
-                raise
-        return self._interpreter
 
     def execute(self, instruction: str) -> str:
-        """
-        Ejecuta una instrucción en lenguaje natural.
-        Devuelve el output completo como string.
-        """
-        logger.info(f"Ejecutando: {instruction[:100]}...")
-        interp = self._get_interpreter()
+        logger.info(f"Ejecutando instrucción: {instruction[:120]}")
 
-        output_parts = []
+        # Detectar si la instrucción contiene código explícito o es lenguaje natural
+        lang, code = self._extract_code(instruction)
+
+        if lang and code:
+            return self._run_code(lang, code)
+        else:
+            # Ejecutar directamente como bash si suena a comando
+            return self._run_bash(instruction)
+
+    def _extract_code(self, text: str) -> tuple[str, str]:
+        # Busca bloques ```bash, ```python, ```sh
+        match = re.search(r"```(bash|sh|python|py)?\s*\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
+        if match:
+            lang = (match.group(1) or "bash").lower()
+            lang = "python" if lang == "py" else lang
+            lang = "bash" if lang == "sh" else lang
+            return lang, match.group(2).strip()
+        return "", ""
+
+    def _run_bash(self, command: str) -> str:
         try:
-            for chunk in interp.chat(instruction, display=False, stream=True):
-                if isinstance(chunk, dict):
-                    if chunk.get("type") == "message" and chunk.get("content"):
-                        output_parts.append(str(chunk["content"]))
-                    elif chunk.get("type") == "code" and chunk.get("content"):
-                        output_parts.append(f"```\n{chunk['content']}\n```")
-                    elif chunk.get("type") == "console" and chunk.get("content"):
-                        output_parts.append(f"[output] {chunk['content']}")
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=TIMEOUT,
+                cwd=WORK_DIR,
+                env={**os.environ, "TERM": "dumb"},
+            )
+            output = ""
+            if result.stdout:
+                output += result.stdout
+            if result.stderr:
+                output += f"\n[stderr]\n{result.stderr}"
+            if result.returncode != 0:
+                output += f"\n[exit code: {result.returncode}]"
 
-            result = "\n".join(output_parts).strip()
-            logger.debug(f"Resultado: {result[:200]}")
-            return result or "Ejecución completada sin output."
+            output = output.strip()
+            if len(output) > MAX_OUTPUT:
+                output = output[:MAX_OUTPUT] + f"\n...[truncado a {MAX_OUTPUT} chars]"
+            return output or "(sin output)"
 
+        except subprocess.TimeoutExpired:
+            return f"Timeout: el comando superó {TIMEOUT}s."
         except Exception as e:
-            logger.error(f"Error en InterpreterTool: {e}")
-            return f"Error al ejecutar: {str(e)}"
+            logger.error(f"Error ejecutando bash: {e}")
+            return f"Error: {str(e)}"
+
+    def _run_code(self, lang: str, code: str) -> str:
+        if lang == "python":
+            return self._run_python(code)
+        return self._run_bash(code)
+
+    def _run_python(self, code: str) -> str:
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py", delete=False, encoding="utf-8"
+            ) as f:
+                f.write(code)
+                tmp_path = f.name
+
+            result = subprocess.run(
+                ["python", tmp_path],
+                capture_output=True,
+                text=True,
+                timeout=TIMEOUT,
+                cwd=WORK_DIR,
+            )
+            os.unlink(tmp_path)
+
+            output = result.stdout
+            if result.stderr:
+                output += f"\n[stderr]\n{result.stderr}"
+            if result.returncode != 0:
+                output += f"\n[exit code: {result.returncode}]"
+
+            output = output.strip()
+            if len(output) > MAX_OUTPUT:
+                output = output[:MAX_OUTPUT] + f"\n...[truncado]"
+            return output or "(sin output)"
+
+        except subprocess.TimeoutExpired:
+            return f"Timeout: el script superó {TIMEOUT}s."
+        except Exception as e:
+            logger.error(f"Error ejecutando Python: {e}")
+            return f"Error: {str(e)}"
 
     def reset(self):
-        if self._interpreter:
-            self._interpreter.messages = []
-            logger.debug("Contexto de interpreter reseteado")
-
-
-# Definición de la tool para Gemini function calling
-INTERPRETER_TOOL_DEFINITION = {
-    "name": "execute_code",
-    "description": (
-        "Ejecuta comandos o código en el sistema Linux del usuario. "
-        "Puede crear/modificar archivos, ejecutar scripts Python/Bash, "
-        "instalar paquetes, clonar repos, analizar código, etc. "
-        "Usa esto cuando el usuario pida realizar acciones en su sistema."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "instruction": {
-                "type": "string",
-                "description": "Instrucción clara en lenguaje natural de lo que ejecutar",
-            }
-        },
-        "required": ["instruction"],
-    },
-}
+        pass  # stateless, nada que resetear

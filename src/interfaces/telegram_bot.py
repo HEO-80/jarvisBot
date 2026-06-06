@@ -1,8 +1,11 @@
 """
 Interfaz de Telegram para Jarvis.
-Recibe mensajes, los enruta al Cerebro y devuelve respuestas.
+Maneja mensajes de texto y voz, enruta al Cerebro y responde con audio.
 """
 import logging
+import os
+import tempfile
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -13,8 +16,9 @@ from telegram.ext import (
 )
 from telegram.constants import ChatAction
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, VOICE_ENABLED, VOICE_MODEL
 from agentes.cerebro_openclaw import Cerebro
+from utils.voice import clean_for_tts, text_to_speech, transcribe, ogg_to_wav
 
 logger = logging.getLogger("jarvis.telegram")
 
@@ -25,39 +29,71 @@ def _is_authorized(update: Update) -> bool:
     return update.effective_user.id == TELEGRAM_ALLOWED_USER_ID
 
 
+async def _send_reply(update: Update, text: str, force_text: bool = False):
+    if VOICE_ENABLED and not force_text:
+        spoken = clean_for_tts(text)
+        with tempfile.TemporaryDirectory() as tmp:
+            wav_path = os.path.join(tmp, "response.wav")
+            if text_to_speech(spoken, wav_path, VOICE_MODEL):
+                with open(wav_path, "rb") as audio:
+                    caption = spoken[:1024] if len(spoken) <= 1024 else spoken[:1021] + "..."
+                    await update.message.reply_voice(audio, caption=caption)
+                return
+        logger.warning("TTS falló, enviando texto")
+
+    # Fallback o modo texto: partir si supera límite Telegram
+    if len(text) > 4096:
+        for i in range(0, len(text), 4096):
+            await update.message.reply_text(text[i:i+4096])
+    else:
+        await update.message.reply_text(text)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         await update.message.reply_text("Acceso denegado.")
         return
-    await update.message.reply_text(
-        "Jarvis activo. ¿En qué puedo ayudarte?\n\n"
-        "Comandos:\n"
+    msg = (
+        "Jarvis en línea. A su servicio.\n\n"
+        "Puede enviarme mensajes de texto o de voz.\n"
         "/reset — borrar contexto\n"
-        "/status — estado del sistema"
+        "/status — estado del sistema\n"
+        "/texto — respuesta solo en texto"
     )
+    await update.message.reply_text(msg)
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         return
     CEREBRO.reset_context()
-    await update.message.reply_text("Contexto borrado. Empezamos de cero.")
+    await update.message.reply_text("Contexto borrado. Listo para una nueva sesión.")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
         return
     msgs = len(CEREBRO.history)
+    voice_status = f"activa ({os.path.basename(VOICE_MODEL)})" if VOICE_ENABLED else "desactivada"
     await update.message.reply_text(
         f"Sistema activo.\n"
-        f"Modelo: {CEREBRO.model.model_name}\n"
-        f"Mensajes en contexto: {msgs}"
+        f"Modelo: {CEREBRO._get_model().model_name}\n"
+        f"Mensajes en contexto: {msgs}\n"
+        f"Voz: {voice_status}"
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_authorized(update):
-        logger.warning(f"Acceso denegado para user_id={update.effective_user.id}")
+        return
+    context.user_data["force_text"] = not context.user_data.get("force_text", False)
+    estado = "desactivada" if context.user_data["force_text"] else "activada"
+    await update.message.reply_text(f"Respuesta por voz {estado}.")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        logger.warning(f"Acceso denegado user_id={update.effective_user.id}")
         await update.message.reply_text("No estás autorizado para usar este bot.")
         return
 
@@ -66,15 +102,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.chat.send_action(ChatAction.TYPING)
-
     response = CEREBRO.chat(user_text)
 
-    # Telegram tiene límite de 4096 chars por mensaje
-    if len(response) > 4096:
-        for i in range(0, len(response), 4096):
-            await update.message.reply_text(response[i:i+4096])
-    else:
-        await update.message.reply_text(response)
+    force_text = context.user_data.get("force_text", False)
+    await _send_reply(update, response, force_text=force_text)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_authorized(update):
+        await update.message.reply_text("No estás autorizado para usar este bot.")
+        return
+
+    await update.message.chat.send_action(ChatAction.RECORD_VOICE)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ogg_path = os.path.join(tmp, "voice.ogg")
+        wav_path = os.path.join(tmp, "voice.wav")
+
+        voice_file = await update.message.voice.get_file()
+        await voice_file.download_to_drive(ogg_path)
+
+        if not ogg_to_wav(ogg_path, wav_path):
+            await update.message.reply_text("Error al procesar el audio.")
+            return
+
+        user_text = transcribe(wav_path)
+
+    if not user_text:
+        await update.message.reply_text("No pude entender el audio. ¿Puedes repetirlo?")
+        return
+
+    logger.info(f"Voz transcrita: {user_text}")
+    await update.message.reply_text(f"_{user_text}_", parse_mode="Markdown")
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    response = CEREBRO.chat(user_text)
+
+    force_text = context.user_data.get("force_text", False)
+    await _send_reply(update, response, force_text=force_text)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -90,7 +155,9 @@ def create_app(cerebro: Cerebro) -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("texto", cmd_texto))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
 
     logger.info("Aplicación Telegram configurada")
