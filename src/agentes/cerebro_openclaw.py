@@ -3,32 +3,45 @@ Cerebro de Jarvis: orquestador basado en Gemini con function calling.
 Gestiona el contexto de conversación, razona sobre las peticiones
 y decide qué herramientas invocar.
 """
-import json
 import logging
-from typing import Any
 
 import google.generativeai as genai
 
 from config import GEMINI_API_KEY, GEMINI_MODEL, SYSTEM_PROMPT
-from agentes.herramienta_interpreter import InterpreterTool, INTERPRETER_TOOL_DEFINITION
+from agentes.herramienta_interpreter import InterpreterTool
 
 logger = logging.getLogger("jarvis.cerebro")
 
-MAX_HISTORY = 20  # mensajes en contexto antes de resumir
+MAX_HISTORY = 20
+
+
+def _build_tools() -> list:
+    execute_code = genai.protos.FunctionDeclaration(
+        name="execute_code",
+        description=(
+            "Ejecuta comandos o código en el sistema Linux del usuario. "
+            "Puede crear/modificar archivos, ejecutar scripts Python/Bash, "
+            "instalar paquetes, clonar repos, analizar código, etc."
+        ),
+        parameters=genai.protos.Schema(
+            type=genai.protos.Type.OBJECT,
+            properties={
+                "instruction": genai.protos.Schema(
+                    type=genai.protos.Type.STRING,
+                    description="Instrucción clara en lenguaje natural de lo que ejecutar",
+                )
+            },
+            required=["instruction"],
+        ),
+    )
+    return [genai.protos.Tool(function_declarations=[execute_code])]
 
 
 class Cerebro:
     def __init__(self, auto_run: bool = False):
         genai.configure(api_key=GEMINI_API_KEY)
 
-        self.tools = [
-            genai.protos.Tool(
-                function_declarations=[
-                    genai.protos.FunctionDeclaration(**INTERPRETER_TOOL_DEFINITION)
-                ]
-            )
-        ]
-
+        self.tools = _build_tools()
         self.model = genai.GenerativeModel(
             model_name=GEMINI_MODEL,
             system_instruction=SYSTEM_PROMPT,

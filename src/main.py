@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import os
 
@@ -23,7 +24,12 @@ def main():
     app = create_app(cerebro)
 
     logger.info("Jarvis listo. Escuchando mensajes de Telegram...")
-    app.run_polling(drop_pending_updates=True)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        app.run_polling(drop_pending_updates=True)
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":
